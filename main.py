@@ -1,37 +1,23 @@
-import asyncio
-import aiohttp
-import pandas as pd
+import asyncio, aiohttp, os
 from web3 import Web3
-from solana.rpc.async_api import AsyncClient as SolanaClient
-from solana.publickey import PublicKey
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
-TELEGRAM_TOKEN = "YOUR_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MIN_LIQUIDITY = 1000
-MAX_MARKETCAP = 200_000
+MAX_MARKETCAP = 250_000  # Updated cap
+MAX_TAX = 15             # Max acceptable tax percent
+
 DEX_API = "https://api.dexscreener.io/latest/dex/pairs"
 HONEYPOT_API = "https://api.honeypot.is/v1/IsHoneypot"
-
-CHAINS = {
-    "Ethereum": "eth",
-    "Base": "base"
-}
+CHAINS = {"Ethereum": "eth", "Base": "base"}
 
 RPCS = {
     "Ethereum": Web3.HTTPProvider("https://cloudflare-eth.com"),
     "Base": Web3.HTTPProvider("https://mainnet.base.org")
 }
-
-SOLANA_RPC = "https://api.mainnet-beta.solana.com"
-SOLANA_CLIENT = SolanaClient(SOLANA_RPC)
-
 w3_instances = {c: Web3(rpc) for c, rpc in RPCS.items()}
 seen = set()
-
-MEME_REFERENCES = ["doge", "pepe", "shiba", "fartcoin"]
 
 async def fetch_pairs(session, chain_key):
     try:
@@ -43,7 +29,14 @@ async def fetch_pairs(session, chain_key):
 async def honeypot_check(session, address):
     try:
         res = await session.post(HONEYPOT_API, json={"address": address})
-        return res.ok and not (await res.json())['honeypotResult']['isHoneypot']
+        if not res.ok:
+            return False
+        data = await res.json()
+        result = data.get("honeypotResult", {})
+        is_safe = not result.get("isHoneypot", True)
+        buy_tax = result.get("buyTax", 100)
+        sell_tax = result.get("sellTax", 100)
+        return is_safe and buy_tax <= MAX_TAX and sell_tax <= MAX_TAX
     except:
         return False
 
@@ -55,25 +48,16 @@ def owner_renounced(web3, contract_address):
     except:
         return False
 
-def meme_score(name):
-    try:
-        corpus = MEME_REFERENCES + [name.lower()]
-        tfidf = TfidfVectorizer().fit_transform(corpus)
-        return cosine_similarity(tfidf[-1:], tfidf[:-1]).max()
-    except:
-        return 0
-
 async def send_alert(session, token, chain):
     text = (
-        f"\u26a0\ufe0f *New Token Alert*\n"
+        f"🚨 *New Safe Token Detected*\n"
         f"Chain: {chain}\n"
         f"Name: {token['baseToken']['name']}\n"
         f"Symbol: {token['baseToken']['symbol']}\n"
-        f"MemeScore: {meme_score(token['baseToken']['name']):.2f}\n"
         f"Liquidity: ${token['liquidity']['usd']:.0f}\n"
         f"Market Cap: ${token.get('fdv', 0):,}\n"
         f"Contract: `{token['pairAddress']}`\n"
-        f"[Chart]({token['url']})"
+        f"[View Chart]({token['url']})"
     )
     await session.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -99,17 +83,12 @@ async def check_chain(session, chain, key):
         await send_alert(session, token, chain)
         seen.add(address)
 
-async def check_solana(session):
-    # Placeholder logic, adapt based on Solana DEX data
-    return
-
 async def main():
     async with aiohttp.ClientSession() as session:
         while True:
             for chain, key in CHAINS.items():
                 await check_chain(session, chain, key)
-            await check_solana(session)
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
 
 if __name__ == "__main__":
     asyncio.run(main())
