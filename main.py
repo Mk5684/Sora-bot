@@ -1,22 +1,39 @@
 import asyncio, aiohttp, os
 from web3 import Web3
+from solana.rpc.async_api import AsyncClient
+from solana.publickey import PublicKey
+from sklearn.ensemble import RandomForestClassifier
+import joblib
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MIN_LIQUIDITY = 1000
-MAX_MARKETCAP = 100_000
+MAX_MARKETCAP = 200_000
 
 DEX_API = "https://api.dexscreener.io/latest/dex/pairs"
+RAYDIUM_API = "https://api.dexscreener.io/latest/dex/pairs/solana"
 HONEYPOT_API = "https://api.honeypot.is/v1/IsHoneypot"
-CHAINS = {"Ethereum": "eth", "Base": "base"}
+CHAINS = {
+    "Ethereum": "eth",
+    "Base": "base",
+    "Solana": "solana"
+}
 
 RPCS = {
     "Ethereum": Web3.HTTPProvider("https://cloudflare-eth.com"),
     "Base": Web3.HTTPProvider("https://mainnet.base.org")
 }
-w3_instances = {c: Web3(rpc) for c, rpc in RPCS.items()}
+
+w3_instances = {c: Web3(rpc) for c, rpc in RPCS.items() if c != "Solana"}
+solana_client = AsyncClient("https://api.mainnet-beta.solana.com")
 seen = set()
+
+model_path = "ml_model.pkl"
+if os.path.exists(model_path):
+    ml_model = joblib.load(model_path)
+else:
+    ml_model = None
 
 async def fetch_pairs(session, chain_key):
     try:
@@ -40,6 +57,20 @@ def owner_renounced(web3, contract_address):
     except:
         return False
 
+def ml_token_score(token):
+    if not ml_model:
+        return True
+    features = [
+        token.get("liquidity", {}).get("usd", 0),
+        token.get("fdv", 0),
+        len(token["baseToken"].get("name", "")),
+        len(token["baseToken"].get("symbol", ""))
+    ]
+    try:
+        return ml_model.predict([features])[0] == 1
+    except:
+        return False
+
 async def send_alert(session, token, chain):
     text = (
         f"🚨 *New Safe Token Detected*\n"
@@ -57,7 +88,6 @@ async def send_alert(session, token, chain):
     )
 
 async def check_chain(session, chain, key):
-    web3 = w3_instances[chain]
     tokens = await fetch_pairs(session, key)
     for token in tokens:
         address = token.get("pairAddress")
@@ -67,10 +97,14 @@ async def check_chain(session, chain, key):
         mc = token.get("fdv", 0) or 0
         if liq < MIN_LIQUIDITY or mc > MAX_MARKETCAP:
             continue
-        if not await honeypot_check(session, address):
+        if chain != "Solana" and not await honeypot_check(session, address):
             continue
-        token_addr = Web3.toChecksumAddress(token["baseToken"]["address"])
-        if not owner_renounced(web3, token_addr):
+        if chain != "Solana":
+            token_addr = Web3.toChecksumAddress(token["baseToken"]["address"])
+            web3 = w3_instances[chain]
+            if not owner_renounced(web3, token_addr):
+                continue
+        if not ml_token_score(token):
             continue
         await send_alert(session, token, chain)
         seen.add(address)
