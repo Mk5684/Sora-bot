@@ -1,23 +1,23 @@
-import asyncio, aiohttp, os
+import asyncio
+import aiohttp
+import pandas as pd
 from web3 import Web3
-from solana.rpc.async_api import AsyncClient
+from solana.rpc.async_api import AsyncClient as SolanaClient
 from solana.publickey import PublicKey
-from sklearn.ensemble import RandomForestClassifier
-import joblib
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = "YOUR_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
 MIN_LIQUIDITY = 1000
 MAX_MARKETCAP = 200_000
-
 DEX_API = "https://api.dexscreener.io/latest/dex/pairs"
-RAYDIUM_API = "https://api.dexscreener.io/latest/dex/pairs/solana"
 HONEYPOT_API = "https://api.honeypot.is/v1/IsHoneypot"
+
 CHAINS = {
     "Ethereum": "eth",
-    "Base": "base",
-    "Solana": "solana"
+    "Base": "base"
 }
 
 RPCS = {
@@ -25,15 +25,13 @@ RPCS = {
     "Base": Web3.HTTPProvider("https://mainnet.base.org")
 }
 
-w3_instances = {c: Web3(rpc) for c, rpc in RPCS.items() if c != "Solana"}
-solana_client = AsyncClient("https://api.mainnet-beta.solana.com")
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+SOLANA_CLIENT = SolanaClient(SOLANA_RPC)
+
+w3_instances = {c: Web3(rpc) for c, rpc in RPCS.items()}
 seen = set()
 
-model_path = "ml_model.pkl"
-if os.path.exists(model_path):
-    ml_model = joblib.load(model_path)
-else:
-    ml_model = None
+MEME_REFERENCES = ["doge", "pepe", "shiba", "fartcoin"]
 
 async def fetch_pairs(session, chain_key):
     try:
@@ -45,7 +43,7 @@ async def fetch_pairs(session, chain_key):
 async def honeypot_check(session, address):
     try:
         res = await session.post(HONEYPOT_API, json={"address": address})
-        return res.ok and not (await res.json())["honeypotResult"]["isHoneypot"]
+        return res.ok and not (await res.json())['honeypotResult']['isHoneypot']
     except:
         return False
 
@@ -57,30 +55,25 @@ def owner_renounced(web3, contract_address):
     except:
         return False
 
-def ml_token_score(token):
-    if not ml_model:
-        return True
-    features = [
-        token.get("liquidity", {}).get("usd", 0),
-        token.get("fdv", 0),
-        len(token["baseToken"].get("name", "")),
-        len(token["baseToken"].get("symbol", ""))
-    ]
+def meme_score(name):
     try:
-        return ml_model.predict([features])[0] == 1
+        corpus = MEME_REFERENCES + [name.lower()]
+        tfidf = TfidfVectorizer().fit_transform(corpus)
+        return cosine_similarity(tfidf[-1:], tfidf[:-1]).max()
     except:
-        return False
+        return 0
 
 async def send_alert(session, token, chain):
     text = (
-        f"🚨 *New Safe Token Detected*\n"
+        f"\u26a0\ufe0f *New Token Alert*\n"
         f"Chain: {chain}\n"
         f"Name: {token['baseToken']['name']}\n"
         f"Symbol: {token['baseToken']['symbol']}\n"
+        f"MemeScore: {meme_score(token['baseToken']['name']):.2f}\n"
         f"Liquidity: ${token['liquidity']['usd']:.0f}\n"
         f"Market Cap: ${token.get('fdv', 0):,}\n"
         f"Contract: `{token['pairAddress']}`\n"
-        f"[View Chart]({token['url']})"
+        f"[Chart]({token['url']})"
     )
     await session.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -88,6 +81,7 @@ async def send_alert(session, token, chain):
     )
 
 async def check_chain(session, chain, key):
+    web3 = w3_instances[chain]
     tokens = await fetch_pairs(session, key)
     for token in tokens:
         address = token.get("pairAddress")
@@ -97,24 +91,25 @@ async def check_chain(session, chain, key):
         mc = token.get("fdv", 0) or 0
         if liq < MIN_LIQUIDITY or mc > MAX_MARKETCAP:
             continue
-        if chain != "Solana" and not await honeypot_check(session, address):
+        if not await honeypot_check(session, address):
             continue
-        if chain != "Solana":
-            token_addr = Web3.toChecksumAddress(token["baseToken"]["address"])
-            web3 = w3_instances[chain]
-            if not owner_renounced(web3, token_addr):
-                continue
-        if not ml_token_score(token):
+        token_addr = Web3.toChecksumAddress(token["baseToken"]["address"])
+        if not owner_renounced(web3, token_addr):
             continue
         await send_alert(session, token, chain)
         seen.add(address)
+
+async def check_solana(session):
+    # Placeholder logic, adapt based on Solana DEX data
+    return
 
 async def main():
     async with aiohttp.ClientSession() as session:
         while True:
             for chain, key in CHAINS.items():
                 await check_chain(session, chain, key)
-            await asyncio.sleep(15)
+            await check_solana(session)
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
     asyncio.run(main())
